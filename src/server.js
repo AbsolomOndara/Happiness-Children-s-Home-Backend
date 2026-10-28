@@ -35,6 +35,7 @@ const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHe
 const uploadLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false });
 const contactLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 8, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many messages. Please try again later.' } });
 const donorLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 6, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Please wait before submitting another registration.' } });
+const trafficLimiter = rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false });
 
 const imageUpload = multer({
   storage: multer.memoryStorage(),
@@ -92,6 +93,7 @@ const donorSchema = z.object({
 });
 const statusSchema = z.object({ status: z.enum(['new', 'read', 'replied']) });
 const reminderSchema = z.object({ channel: z.enum(['email', 'whatsapp']), message: z.string().trim().min(2).max(1200) });
+const trafficSchema = z.object({ path: z.string().trim().min(1).max(200).refine((path) => path.startsWith('/') && !path.startsWith('//') && !path.startsWith('/admin'), 'Invalid page path.') });
 const parse = (schema, input) => {
   const result = schema.safeParse(input);
   if (!result.success) throw Object.assign(new Error(result.error.issues[0]?.message || 'Invalid input.'), { status: 400 });
@@ -113,6 +115,11 @@ app.get('/health', (_req, res) => res.set({ 'Cache-Control': 'no-store', 'X-Robo
 app.get('/api/gallery', noPublicCache, asyncRoute(async (_req, res) => {
   const { rows } = await query('SELECT id,title,alt_text AS "altText",category,image_url AS "imageUrl",created_at AS "createdAt" FROM gallery_photos ORDER BY sort_order ASC, created_at DESC');
   res.json(rows);
+}));
+app.post('/api/traffic', noPublicCache, trafficLimiter, asyncRoute(async (req, res) => {
+  const { path } = parse(trafficSchema, req.body);
+  await query('INSERT INTO site_page_views(path) VALUES($1)', [path]);
+  res.status(202).json({ ok: true });
 }));
 app.get('/api/events', noPublicCache, asyncRoute(async (_req, res) => {
   const { rows } = await query("SELECT id,title,description,starts_at AS \"startsAt\",location,category,registration_url AS \"registrationUrl\",image_url AS \"imageUrl\" FROM events WHERE published=true AND starts_at >= NOW() - INTERVAL '1 day' ORDER BY starts_at ASC");
@@ -196,6 +203,53 @@ app.get('/api/admin/insights', requireAdmin, asyncRoute(async (_req, res) => {
     query('SELECT country,COUNT(*)::int AS count FROM donors GROUP BY country ORDER BY count DESC,country ASC LIMIT 5'),
   ]);
   res.json({ counts: { gallery: gallery.rows[0].count, upcomingEvents: events.rows[0].count, inquiries: inquiries.rows[0].count, unreadInquiries: unread.rows[0].count, donors: donors.rows[0].count }, recentInquiries: recentInquiries.rows, recentDonors: recentDonors.rows, donorsByCountry: countries.rows });
+}));
+app.get('/api/admin/traffic', requireAdmin, asyncRoute(async (req, res) => {
+  const periods = {
+    day: { unit: 'hour', offset: '23 hours', step: '1 hour' },
+    week: { unit: 'day', offset: '6 days', step: '1 day' },
+    month: { unit: 'day', offset: '29 days', step: '1 day' },
+    year: { unit: 'month', offset: '11 months', step: '1 month' },
+  };
+  const period = typeof req.query.period === 'string' ? req.query.period : 'week';
+  const window = periods[period];
+  if (!window) throw Object.assign(new Error('Choose day, week, month or year.'), { status: 400 });
+  const { unit, offset, step } = window;
+  const [tracking, chart] = await Promise.all([
+    query('SELECT tracking_started_at AS "trackingStartedAt" FROM site_analytics_meta WHERE id=true'),
+    query(`WITH buckets AS (
+      SELECT generate_series(
+        date_trunc('${unit}', NOW()) - INTERVAL '${offset}',
+        date_trunc('${unit}', NOW()),
+        INTERVAL '${step}'
+      ) AS bucket
+    ), counts AS (
+      SELECT date_trunc('${unit}', viewed_at) AS bucket, COUNT(*)::int AS views
+      FROM site_page_views
+      WHERE viewed_at >= (SELECT MIN(bucket) FROM buckets)
+      GROUP BY 1
+    ), tracking AS (
+      SELECT tracking_started_at FROM site_analytics_meta WHERE id=true
+    )
+    SELECT b.bucket,
+      CASE WHEN b.bucket < date_trunc('${unit}', t.tracking_started_at) THEN NULL
+           ELSE COALESCE(c.views, 0) END AS views
+    FROM buckets b CROSS JOIN tracking t
+    LEFT JOIN counts c ON c.bucket=b.bucket
+    ORDER BY b.bucket ASC`),
+  ]);
+  const firstBucket = chart.rows[0]?.bucket;
+  const pages = firstBucket ? await query(`SELECT path,COUNT(*)::int AS views FROM site_page_views WHERE viewed_at >= $1 GROUP BY path ORDER BY views DESC,path ASC LIMIT 6`, [firstBucket]) : { rows: [] };
+  const points = chart.rows.map((row) => ({ bucket: row.bucket, views: row.views }));
+  const measured = points.map((point) => point.views).filter((value) => value !== null);
+  res.set('Cache-Control', 'no-store').json({
+    period,
+    trackingStartedAt: tracking.rows[0]?.trackingStartedAt || null,
+    totalViews: measured.reduce((total, value) => total + value, 0),
+    peakViews: measured.length ? Math.max(...measured) : 0,
+    points,
+    topPages: pages.rows,
+  });
 }));
 app.get('/api/admin/inquiries', requireAdmin, asyncRoute(async (req, res) => {
   const status = ['new', 'read', 'replied'].includes(req.query.status) ? req.query.status : null;
